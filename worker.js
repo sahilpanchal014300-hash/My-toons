@@ -77,7 +77,7 @@ async function s3Request(env, method, key = "", body = null, contentType = "") {
     : signedHeaders;
 
   const canonicalRequest = [
-    method, path, "", canonicalHeaders, signed, payloadHash
+    method, path, "", canonicalHeaders.trimEnd(), signed, payloadHash
   ].join("\n");
 
   const scope = `${dateStamp}/${env.B2_REGION}/s3/aws4_request`;
