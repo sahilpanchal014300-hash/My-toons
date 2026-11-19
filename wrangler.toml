@@ -1,0 +1,8 @@
+
+name = "my-toons"
+main = "worker.js"
+compatibility_date = "2026-11-19"
+
+[[r2_buckets]]
+binding = "VIDEOS"
+bucket_name = "my-toons-videos"
