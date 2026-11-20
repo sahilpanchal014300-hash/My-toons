@@ -1,449 +1,660 @@
+const HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+  "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload"
+};
 
-        
-const encoder = new TextEncoder();
-
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json", ...headers }
-  });
-}
-
-function b64(bytes) {
-  let s = "";
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromB64(s) {
-  s = s.replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4) s += "=";
-  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
-}
-
-async function sha256(data) {
-  return new Uint8Array(await crypto.subtle.digest("SHA-256", data));
-}
-
-async function hmac(key, data) {
-  const k = await crypto.subtle.importKey(
-    "raw", key, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
-  return new Uint8Array(await crypto.subtle.sign("HMAC", k, encoder.encode(data)));
-}
-
-function hex(bytes) {
-  return [...bytes].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-function awsEncode(s) {
-  return encodeURIComponent(s).replace(/[!'()*]/g, c =>
-    "%" + c.charCodeAt(0).toString(16).toUpperCase()
-  );
-}
-
-async function s3Request(env, method, key = "", body = null, contentType = "") {
-  const endpoint = env.B2_ENDPOINT.replace(/\/+$/, "");
-  const url = new URL(endpoint);
-  const bucket = env.B2_BUCKET;
-  const path = "/" + awsEncode(bucket) +
-    (key ? "/" + key.split("/").map(awsEncode).join("/") : "");
-
-  const now = new Date();
-  const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
-  const dateStamp = amzDate.slice(0, 8);
-
-  const payloadHash = hex(await sha256(body || new Uint8Array()));
-  const headers = {
-    "x-amz-date": amzDate,
-    "x-amz-content-sha256": payloadHash
-  };
-
-  let canonicalHeaders =
-    "host:" + url.host + "\n" +
-    "x-amz-content-sha256:" + payloadHash + "\n" +
-    "x-amz-date:" + amzDate + "\n";
-
-  const signedHeaders = "host;x-amz-content-sha256;x-amz-date";
-
-  if (contentType) {
-    headers["Content-Type"] = contentType;
-    canonicalHeaders =
-      "content-type:" + contentType.trim() + "\n" + canonicalHeaders;
-  }
-
-  const signed = contentType
-    ? "content-type;host;x-amz-content-sha256;x-amz-date"
-    : signedHeaders;
-
-  const canonicalRequest = [
-    method, path, "", canonicalHeaders.trimEnd(), signed, payloadHash
-  ].join("\n");
-
-  const scope = `${dateStamp}/${env.B2_REGION}/s3/aws4_request`;
-  const stringToSign = [
-    "AWS4-HMAC-SHA256",
-    amzDate,
-    scope,
-    hex(await sha256(encoder.encode(canonicalRequest)))
-  ].join("\n");
-
-  const kDate = await hmac(encoder.encode("AWS4" + env.B2_APPLICATION_KEY), dateStamp);
-  const kRegion = await hmac(kDate, env.B2_REGION);
-  const kService = await hmac(kRegion, "s3");
-  const kSigning = await hmac(kService, "aws4_request");
-  const signature = hex(await hmac(kSigning, stringToSign));
-
-  headers.Authorization =
-    `AWS4-HMAC-SHA256 Credential=${env.B2_KEY_ID}/${scope}, SignedHeaders=${signed}, Signature=${signature}`;
-
-  return fetch(endpoint + path, {
-    method,
-    headers,
-    body: body || undefined
-  });
-}
-
-async function adminToken(password, secret) {
-  const payload = b64(encoder.encode(JSON.stringify({
-    exp: Date.now() + 86400000
-  })));
-  const sig = b64(await hmac(encoder.encode(secret), payload));
-  return payload + "." + sig;
-}
-
-async function isAdmin(request, env) {
-  const cookie = request.headers.get("Cookie") || "";
-  const match = cookie.match(/mytoons_session=([^;]+)/);
-  if (!match || !env.ADMIN_PASSWORD) return false;
-
-  const parts = match[1].split(".");
-  if (parts.length !== 2) return false;
-
-  const expected = b64(await hmac(encoder.encode(env.ADMIN_PASSWORD), parts[0]));
-  if (expected !== parts[1]) return false;
-
-  try {
-    return JSON.parse(new TextDecoder().decode(fromB64(parts[0]))).exp > Date.now();
-  } catch {
-    return false;
-  }
-}
-
-function xmlDecode(s) {
-  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">").replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'");
-}
-
-async function listVideos(env) {
-  const res = await s3Request(env, "GET");
-  if (!res.ok) throw new Error("Backblaze list error: " + res.status);
-
-  const xml = await res.text();
-  const videos = [];
-  const blocks = xml.match(/<Contents>[\s\S]*?<\/Contents>/g) || [];
-
-  for (const block of blocks) {
-    const keyMatch = block.match(/<Key>([\s\S]*?)<\/Key>/);
-    const sizeMatch = block.match(/<Size>(\d+)<\/Size>/);
-    if (!keyMatch) continue;
-
-    const key = xmlDecode(keyMatch[1]);
-    const name = key.split("/").pop();
-    const category = key.split("/")[0] || "Movies";
-
-    videos.push({
-      key,
-      name,
-      category,
-      size: sizeMatch ? Number(sizeMatch[1]) : 0,
-      url: "/media/" + key.split("/").map(encodeURIComponent).join("/")
-    });
-  }
-  return videos.reverse();
-}
-
-function page() {
-  return `<!DOCTYPE html>
+const HTML = String.raw`<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>My toons</title>
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#10111b;color:#fff;font-family:Arial,sans-serif}
-header{padding:20px;background:#191b2b;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-h1{margin:0;color:#ffb52e}
-button{border:0;border-radius:8px;padding:11px 16px;background:#ffb52e;color:#171717;font-weight:bold;cursor:pointer}
-main{padding:20px;max-width:1100px;margin:auto}
-input,select{padding:12px;border-radius:8px;border:1px solid #444;background:#202235;color:white;width:100%;margin:7px 0}
-.tabs{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}
-.tabs button{background:#292c40;color:white}
-.tabs button.active{background:#ffb52e;color:#111}
+body{margin:0;background:#10131b;color:#f4f5f8;font:16px Arial,sans-serif}
+header{padding:22px 5%;background:#191e2b;display:flex;gap:16px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+h1{margin:0;color:#ffbd59;font-size:28px}
+.sub{color:#aeb6c8;font-size:13px;margin-top:5px}
+.actions{display:flex;gap:8px;flex-wrap:wrap}
+button{border:0;border-radius:9px;padding:11px 15px;background:#ffbd59;color:#171717;font-weight:bold;cursor:pointer}
+button.secondary{background:#30394c;color:#fff}
+main{max-width:1100px;margin:auto;padding:22px 5%}
+.tools{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+input,select{background:#202737;color:#fff;border:1px solid #3a465d;border-radius:9px;padding:12px;font-size:15px}
+#search{flex:1;min-width:180px}
+.tabs{display:flex;gap:8px;margin:18px 0}
+.tabs button{background:#30394c;color:white}
+.tabs button.active{background:#ffbd59;color:#171717}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:16px}
-.card{background:#202235;padding:14px;border-radius:12px;overflow:hidden}
-.card video{width:100%;max-height:180px;background:#000;border-radius:8px}
-.card h3{overflow-wrap:anywhere}
-.small{color:#bbb;font-size:13px}
-#adminPanel{display:none;background:#202235;padding:16px;border-radius:12px;margin:15px 0}
-#status{color:#ffcf70;margin:10px 0}
+.video{background:#1b2230;border:1px solid #2d374a;border-radius:12px;overflow:hidden}
+.video video{display:block;width:100%;aspect-ratio:16/9;background:#000}
+.info{padding:12px}
+.name{font-weight:bold;overflow-wrap:anywhere}
+.tag{color:#ffbd59;font-size:12px;margin-top:6px}
+.empty{color:#aeb6c8;padding:30px 0}
+.panel{display:none;background:#1b2230;border:1px solid #344057;border-radius:12px;padding:16px;margin:18px 0}
+.panel.show{display:block}
+.panel input,.panel select{width:100%;margin:7px 0 12px}
+.status{color:#ffcf83;min-height:20px;font-size:14px}
+.delete{background:#a83e4a;color:white;margin-top:10px}
+.foot{text-align:center;color:#7f899d;padding:30px;font-size:13px}
 </style>
 </head>
 <body>
 <header>
-<h1>🎬 My toons</h1>
-<button id="adminBtn">Admin Login</button>
+<div>
+<h1>My toons</h1>
+<div class="sub">Movies • Cartoons • Entertainment</div>
+</div>
+<div class="actions">
+<button class="secondary" id="adminBtn">Admin Login</button>
+<button class="secondary" id="logoutBtn" hidden>Logout</button>
+</div>
 </header>
+
 <main>
-<input id="search" placeholder="Search movies and cartoons...">
+<div class="tools">
+<input id="search" placeholder="Search videos...">
+<select id="category">
+<option value="All">All categories</option>
+<option value="Movies">Movies</option>
+<option value="Cartoons">Cartoons</option>
+</select>
+</div>
+
 <div class="tabs">
 <button class="active" data-cat="All">All</button>
 <button data-cat="Movies">Movies</button>
 <button data-cat="Cartoons">Cartoons</button>
 </div>
-<div id="adminPanel">
-<h2>Admin Panel</h2>
+
+<section id="adminPanel" class="panel">
+<h2>Admin panel</h2>
 <form id="uploadForm">
-<label>Choose video</label>
-<input type="file" name="video" accept="video/*" required>
+<label>Video title</label>
+<input name="title" required maxlength="100" placeholder="Video title">
 <label>Category</label>
 <select name="category">
-<option value="Movies">Movies</option>
-<option value="Cartoons">Cartoons</option>
+<option>Movies</option>
+<option>Cartoons</option>
 </select>
-<button type="submit">Upload Video</button>
+<label>Choose video (max 80 MB)</label>
+<input name="file" type="file" accept="video/*" required>
+<button id="uploadBtn" type="submit">Upload video</button>
 </form>
-<p id="status"></p>
-<button id="logoutBtn">Logout</button>
-</div>
-<h2>Videos</h2>
-<div id="videos" class="grid">Loading videos...</div>
-</main>
-<script>
-let allVideos=[];
-let category="All";
-let admin=false;
+<div id="status" class="status"></div>
+</section>
 
-async function loadStatus(){
-  const r=await fetch("/api/admin/status");
-  const d=await r.json();
-  admin=d.admin;
-  document.getElementById("adminPanel").style.display=admin?"block":"none";
-  document.getElementById("adminBtn").textContent=admin?"Admin Active":"Admin Login";
+<div id="videos" class="grid"></div>
+<div id="empty" class="empty" hidden>No videos found yet.</div>
+</main>
+
+<div class="foot">My toons</div>
+
+<script>
+const $=id=>document.getElementById(id);
+let allVideos=[];
+let isAdmin=false;
+let activeCat='All';
+
+async function api(path,options={}){
+  const r=await fetch(path,options);
+  let data={};
+  try{data=await r.json()}catch{}
+  if(!r.ok)throw new Error(data.error||'Request failed');
+  return data;
 }
 
-async function loadVideos(){
-  const box=document.getElementById("videos");
-  try{
-    const r=await fetch("/api/videos");
-    const d=await r.json();
-    if(!r.ok) throw new Error(d.error||"Could not load videos");
-    allVideos=d.videos||[];
-    render();
-  }catch(e){box.textContent=e.message}
+function mediaUrl(key){
+  return '/media?key='+encodeURIComponent(key);
 }
 
 function render(){
-  const q=document.getElementById("search").value.toLowerCase();
-  const box=document.getElementById("videos");
-  box.innerHTML="";
-  const filtered=allVideos.filter(v=>
-    (category==="All"||v.category.toLowerCase()===category.toLowerCase()) &&
-    v.name.toLowerCase().includes(q)
+  const q=$('search').value.trim().toLowerCase();
+  const cat=$('category').value;
+
+  const list=allVideos.filter(v=>
+    (cat==='All'||v.category===cat)&&
+    (activeCat==='All'||v.category===activeCat)&&
+    v.title.toLowerCase().includes(q)
   );
-  if(!filtered.length){box.textContent="No videos found.";return}
-  filtered.forEach(v=>{
-    const card=document.createElement("div");
-    card.className="card";
-    const video=document.createElement("video");
+
+  $('videos').innerHTML='';
+  $('empty').hidden=list.length>0;
+
+  for(const v of list){
+    const card=document.createElement('article');
+    card.className='video';
+
+    const video=document.createElement('video');
     video.controls=true;
-    video.preload="metadata";
-    video.src=v.url;
-    const title=document.createElement("h3");
-    title.textContent=v.name;
-    const info=document.createElement("p");
-    info.className="small";
-    info.textContent=v.category+" • "+(v.size/1048576).toFixed(1)+" MB";
-    card.append(video,title,info);
-    if(admin){
-      const del=document.createElement("button");
-      del.textContent="Delete";
-      del.onclick=async()=>{
-        if(!confirm("Delete this video?"))return;
-        const r=await fetch("/api/videos?key="+encodeURIComponent(v.key),{method:"DELETE"});
-        const d=await r.json();
-        if(!r.ok){alert(d.error||"Delete failed");return}
-        loadVideos();
-      };
-      card.append(del);
+    video.preload='metadata';
+    video.src=mediaUrl(v.key);
+
+    const info=document.createElement('div');
+    info.className='info';
+
+    const name=document.createElement('div');
+    name.className='name';
+    name.textContent=v.title;
+
+    const tag=document.createElement('div');
+    tag.className='tag';
+    tag.textContent=v.category;
+
+    info.append(name,tag);
+
+    if(isAdmin){
+      const del=document.createElement('button');
+      del.className='delete';
+      del.textContent='Delete';
+      del.onclick=()=>deleteVideo(v.key);
+      info.append(del);
     }
-    box.append(card);
-  });
+
+    card.append(video,info);
+    $('videos').append(card);
+  }
 }
 
-document.getElementById("search").addEventListener("input",render);
-document.querySelectorAll(".tabs button").forEach(b=>{
+async function load(){
+  try{
+    const d=await api('/api/videos');
+    allVideos=d.videos||[];
+    render();
+  }catch(e){
+    $('empty').hidden=false;
+    $('empty').textContent=e.message;
+  }
+}
+
+async function checkAdmin(){
+  try{
+    const d=await api('/api/me');
+    isAdmin=!!d.admin;
+  }catch{
+    isAdmin=false;
+  }
+
+  $('adminBtn').hidden=isAdmin;
+  $('logoutBtn').hidden=!isAdmin;
+  $('adminPanel').classList.toggle('show',isAdmin);
+  render();
+}
+
+$('adminBtn').onclick=async()=>{
+  const password=prompt('Admin password enter karein');
+  if(password===null)return;
+
+  try{
+    await api('/api/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({password})
+    });
+    await checkAdmin();
+    $('status').textContent='Login successful';
+  }catch(e){
+    alert(e.message);
+  }
+};
+
+$('logoutBtn').onclick=async()=>{
+  try{
+    await api('/api/logout',{method:'POST'});
+  }catch{}
+  isAdmin=false;
+  await checkAdmin();
+};
+
+$('search').addEventListener('input',render);
+$('category').onchange=render;
+
+document.querySelectorAll('.tabs button').forEach(b=>{
   b.onclick=()=>{
-    document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("active"));
-    b.classList.add("active");
-    category=b.dataset.cat;
+    activeCat=b.dataset.cat;
+    document.querySelectorAll('.tabs button').forEach(x=>
+      x.classList.toggle('active',x===b)
+    );
     render();
   };
 });
 
-document.getElementById("adminBtn").onclick=async()=>{
-  if(admin)return;
-  const password=prompt("Enter admin password");
-  if(!password)return;
-  const r=await fetch("/api/admin/login",{
-    method:"POST",
-    headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({password})
-  });
-  const d=await r.json();
-  if(!r.ok){alert(d.error||"Login failed");return}
-  await loadStatus();
-  loadVideos();
-};
-
-document.getElementById("logoutBtn").onclick=async()=>{
-  await fetch("/api/admin/logout",{method:"POST"});
-  await loadStatus();
-  render();
-};
-
-document.getElementById("uploadForm").onsubmit=async e=>{
+$('uploadForm').onsubmit=async e=>{
   e.preventDefault();
-  const status=document.getElementById("status");
-  status.textContent="Uploading... Please wait.";
-  const r=await fetch("/api/upload",{method:"POST",body:new FormData(e.target)});
-  const d=await r.json();
-  if(!r.ok){status.textContent=d.error||"Upload failed";return}
-  status.textContent="Video uploaded successfully!";
-  e.target.reset();
-  loadVideos();
+  const btn=$('uploadBtn');
+  btn.disabled=true;
+  $('status').textContent='Uploading...';
+
+  try{
+    const fd=new FormData(e.target);
+    await api('/api/upload',{method:'POST',body:fd});
+    $('status').textContent='Upload successful';
+    e.target.reset();
+    await load();
+  }catch(err){
+    $('status').textContent=err.message;
+  }finally{
+    btn.disabled=false;
+  }
 };
 
-loadStatus();
-loadVideos();
+async function deleteVideo(key){
+  if(!confirm('Is video ko delete karna hai?'))return;
+
+  try{
+    await api('/api/videos',{
+      method:'DELETE',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key})
+    });
+    await load();
+  }catch(e){
+    alert(e.message);
+  }
+}
+
+checkAdmin();
+load();
 </script>
 </body>
 </html>`;
+
+function json(data,status=200,extra={}){
+  return new Response(JSON.stringify(data),{
+    status,
+    headers:{
+      ...HEADERS,
+      "Content-Type":"application/json; charset=utf-8",
+      ...extra
+    }
+  });
+}
+
+function page(){
+  return new Response(HTML,{
+    headers:{
+      ...HEADERS,
+      "Content-Type":"text/html; charset=utf-8",
+      "Cache-Control":"no-store"
+    }
+  });
+}
+
+function hex(buffer){
+  return [...new Uint8Array(buffer)]
+    .map(b=>b.toString(16).padStart(2,"0"))
+    .join("");
+}
+
+const enc=new TextEncoder();
+
+async function sha256(data){
+  return hex(await crypto.subtle.digest("SHA-256",data));
+}
+
+async function hmac(key,data){
+  const k=await crypto.subtle.importKey(
+    "raw",
+    key,
+    {name:"HMAC",hash:"SHA-256"},
+    false,
+    ["sign"]
+  );
+
+  return new Uint8Array(
+    await crypto.subtle.sign(
+      "HMAC",
+      k,
+      typeof data==="string"?enc.encode(data):data
+    )
+  );
+}
+
+function awsEncode(s){
+  return encodeURIComponent(s).replace(/[!'()*]/g,c=>
+    "%"+c.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
+
+async function s3(env,method,key="",query="",body=null,contentType="",range=""){
+  const endpoint=new URL(env.B2_ENDPOINT);
+
+  const path="/"+awsEncode(env.B2_BUCKET)+
+    (key?"/"+key.split("/").map(awsEncode).join("/"):"");
+
+  const url=endpoint.origin+path+(query?"?"+query:"");
+
+  const now=new Date();
+  const stamp=now.toISOString().replace(/[:-]|\.\d{3}/g,"");
+  const day=stamp.slice(0,8);
+
+  const payloadHash=body
+    ?await sha256(body)
+    :await sha256(new Uint8Array());
+
+  const headers={
+    "x-amz-content-sha256":payloadHash,
+    "x-amz-date":stamp
+  };
+
+  if(contentType)headers["content-type"]=contentType;
+  if(range)headers.range=range;
+
+  const canonicalHeaders={
+    host:endpoint.host,
+    ...headers
+  };
+
+  const signedHeaders=Object.keys(canonicalHeaders).sort().join(";");
+
+  const canonicalHeaderString=Object.keys(canonicalHeaders)
+    .sort()
+    .map(k=>k+":"+String(canonicalHeaders[k]).trim()+"\n")
+    .join("");
+
+  const canonicalRequest=[
+    method,
+    path,
+    query,
+    canonicalHeaderString,
+    signedHeaders,
+    payloadHash
+  ].join("\n");
+
+  const scope=`${day}/${env.B2_REGION}/s3/aws4_request`;
+
+  const stringToSign=
+    `AWS4-HMAC-SHA256\n${stamp}\n${scope}\n`+
+    await sha256(enc.encode(canonicalRequest));
+
+  const kDate=await hmac(
+    enc.encode("AWS4"+env.B2_APPLICATION_KEY),
+    day
+  );
+
+  const kRegion=await hmac(kDate,env.B2_REGION);
+  const kService=await hmac(kRegion,"s3");
+  const kSigning=await hmac(kService,"aws4_request");
+
+  const signature=hex(await hmac(kSigning,stringToSign));
+
+  headers.Authorization=
+    `AWS4-HMAC-SHA256 Credential=${env.B2_KEY_ID}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+
+  return fetch(url,{
+    method,
+    headers,
+    body:body||undefined
+  });
+}
+
+function xmlDecode(s){
+  return s
+    .replace(/&amp;/g,"&")
+    .replace(/&lt;/g,"<")
+    .replace(/&gt;/g,">")
+    .replace(/&quot;/g,'"')
+    .replace(/&apos;/g,"'");
+}
+
+function safeTitle(key){
+  const base=key.split("/").pop()||"Video";
+
+  return base
+    .replace(/^[0-9a-f-]{30,}_/i,"")
+    .replace(/\.[^.]+$/,"")
+    .replace(/[_-]+/g," ");
+}
+
+function getCategory(key){
+  return key.startsWith("Movies/")?"Movies":"Cartoons";
+}
+
+async function listVideos(env){
+  const query="list-type=2&max-keys=1000";
+  const r=await s3(env,"GET","",query);
+
+  if(!r.ok){
+    throw new Error("Backblaze list error: "+await r.text());
+  }
+
+  const xml=await r.text();
+  const videos=[];
+
+  for(const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)){
+    const keyMatch=match[1].match(/<Key>([\s\S]*?)<\/Key>/);
+    const sizeMatch=match[1].match(/<Size>(\d+)<\/Size>/);
+
+    if(!keyMatch)continue;
+
+    const key=xmlDecode(keyMatch[1]);
+
+    if(!key.startsWith("Movies/")&&!key.startsWith("Cartoons/")){
+      continue;
+    }
+
+    videos.push({
+      key,
+      title:safeTitle(key),
+      category:getCategory(key),
+      size:Number(sizeMatch?.[1]||0)
+    });
+  }
+
+  videos.sort((a,b)=>a.title.localeCompare(b.title));
+  return videos;
+}
+
+async function sessionToken(password,expiry){
+  return hex(await hmac(
+    enc.encode(password),
+    `my-toons-session:${expiry}`
+  ));
+}
+
+async function isAdmin(request,env){
+  const cookieValue=(request.headers.get("Cookie")||"")
+    .split(";")
+    .map(x=>x.trim())
+    .find(x=>x.startsWith("mt_admin="));
+
+  if(!cookieValue)return false;
+
+  const value=cookieValue.slice("mt_admin=".length).split(".");
+  if(value.length!==2)return false;
+
+  const expiry=Number(value[0]);
+
+  if(
+    !Number.isFinite(expiry)||
+    expiry<Date.now()||
+    expiry>Date.now()+86400000
+  ){
+    return false;
+  }
+
+  const expected=await sessionToken(env.ADMIN_PASSWORD,value[0]);
+  return value[1]===expected;
+}
+
+function cookie(value,maxAge){
+  return `mt_admin=${value}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${maxAge}`;
+}
+
+function safeKey(key){
+  return typeof key==="string"&&
+    key.length<900&&
+    (key.startsWith("Movies/")||key.startsWith("Cartoons/"))&&
+    !key.includes("..")&&
+    !key.includes("\\");
 }
 
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-
-    try {
-      if (!env.B2_KEY_ID || !env.B2_APPLICATION_KEY ||
-          !env.B2_ENDPOINT || !env.B2_BUCKET || !env.B2_REGION) {
-        return json({ error: "Backblaze settings are missing." }, 500);
+  async fetch(request,env){
+    try{
+      if(
+        !env.B2_ENDPOINT||
+        !env.B2_BUCKET||
+        !env.B2_REGION||
+        !env.B2_KEY_ID||
+        !env.B2_APPLICATION_KEY||
+        !env.ADMIN_PASSWORD
+      ){
+        return json({error:"Server configuration is incomplete."},500);
       }
 
-      if (path === "/" && request.method === "GET") {
-        return new Response(page(), {
-          headers: { "Content-Type": "text/html; charset=utf-8" }
+      const url=new URL(request.url);
+      const path=url.pathname;
+
+      if(request.method==="GET"&&path==="/"){
+        return page();
+      }
+
+      if(request.method==="GET"&&path==="/api/videos"){
+        return json({videos:await listVideos(env)});
+      }
+
+      if(request.method==="GET"&&path==="/api/me"){
+        return json({admin:await isAdmin(request,env)});
+      }
+
+      if(request.method==="POST"&&path==="/api/login"){
+        const data=await request.json();
+
+        if(
+          typeof data.password!=="string"||
+          data.password!==env.ADMIN_PASSWORD
+        ){
+          return json({error:"Wrong admin password."},401);
+        }
+
+        const expiry=String(Date.now()+86400000);
+        const value=expiry+"."+await sessionToken(env.ADMIN_PASSWORD,expiry);
+
+        return json({ok:true},200,{
+          "Set-Cookie":cookie(value,86400)
         });
       }
 
-      if (path === "/api/admin/login" && request.method === "POST") {
-        if (!env.ADMIN_PASSWORD) {
-          return json({ error: "Admin password is not configured." }, 500);
-        }
-        const data = await request.json();
-        if (data.password !== env.ADMIN_PASSWORD) {
-          return json({ error: "Wrong password." }, 401);
-        }
-        const token = await adminToken(data.password, env.ADMIN_PASSWORD);
-        return json({ success: true }, 200, {
-          "Set-Cookie": `mytoons_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400`
+      if(request.method==="POST"&&path==="/api/logout"){
+        return json({ok:true},200,{
+          "Set-Cookie":cookie("",0)
         });
       }
 
-      if (path === "/api/admin/logout" && request.method === "POST") {
-        return json({ success: true }, 200, {
-          "Set-Cookie": "mytoons_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+      if(request.method==="POST"&&path==="/api/upload"){
+        if(!await isAdmin(request,env)){
+          return json({error:"Admin login required."},401);
+        }
+
+        const form=await request.formData();
+        const file=form.get("file");
+        const title=String(form.get("title")||"").trim();
+        const category=String(form.get("category")||"");
+
+        if(!(file instanceof File)||!file.size){
+          return json({error:"Choose a video file."},400);
+        }
+
+        if(file.size>80*1024*1024){
+          return json({error:"Maximum upload size is 80 MB."},413);
+        }
+
+        if(!["Movies","Cartoons"].includes(category)){
+          return json({error:"Invalid category."},400);
+        }
+
+        if(!file.type.startsWith("video/")){
+          return json({error:"Only video files are allowed."},400);
+        }
+
+        const ext=(file.name.match(/\.[a-z0-9]{1,8}$/i)||[""])[0].toLowerCase();
+
+        const clean=(title||file.name.replace(/\.[^.]+$/,""))
+          .replace(/[^\p{L}\p{N} _-]/gu,"")
+          .trim()
+          .slice(0,80)||"Video";
+
+        const key=
+          `${category}/${crypto.randomUUID()}_${clean.replace(/\s+/g,"_")}${ext}`;
+
+        const bytes=await file.arrayBuffer();
+        const r=await s3(env,"PUT",key,"",bytes,file.type);
+
+        if(!r.ok){
+          return json({
+            error:"Backblaze upload error: "+(await r.text()).slice(0,400)
+          },502);
+        }
+
+        return json({ok:true});
+      }
+
+      if(request.method==="DELETE"&&path==="/api/videos"){
+        if(!await isAdmin(request,env)){
+          return json({error:"Admin login required."},401);
+        }
+
+        const data=await request.json();
+
+        if(!safeKey(data.key)){
+          return json({error:"Invalid video key."},400);
+        }
+
+        const r=await s3(env,"DELETE",data.key);
+
+        if(!r.ok){
+          return json({
+            error:"Backblaze delete error: "+(await r.text()).slice(0,400)
+          },502);
+        }
+
+        return json({ok:true});
+      }
+
+      if(request.method==="GET"&&path==="/media"){
+        const key=url.searchParams.get("key");
+
+        if(!safeKey(key)){
+          return new Response("Not found",{status:404,headers:HEADERS});
+        }
+
+        const range=request.headers.get("Range")||"";
+        const r=await s3(env,"GET",key,"",null,"",range);
+
+        if(!r.ok&&r.status!==206){
+          return new Response("Video not found",{
+            status:r.status,
+            headers:HEADERS
+          });
+        }
+
+        const h=new Headers(HEADERS);
+        h.set("Content-Type",r.headers.get("Content-Type")||"application/octet-stream");
+        h.set("Accept-Ranges","bytes");
+
+        for(const name of ["Content-Length","Content-Range","Last-Modified","ETag"]){
+          const v=r.headers.get(name);
+          if(v)h.set(name,v);
+        }
+
+        h.set("Cache-Control","public, max-age=3600");
+
+        return new Response(r.body,{
+          status:r.status,
+          headers:h
         });
       }
 
-      if (path === "/api/admin/status" && request.method === "GET") {
-        return json({ admin: await isAdmin(request, env) });
-      }
+      return json({error:"Not found."},404);
 
-      if (path === "/api/videos" && request.method === "GET") {
-        const videos = await listVideos(env);
-        return json({ videos });
-      }
-
-      if (path === "/api/upload" && request.method === "POST") {
-        if (!(await isAdmin(request, env))) return json({ error: "Admin login required." }, 401);
-
-        const form = await request.formData();
-        const file = form.get("video");
-        const category = form.get("category");
-
-        if (!file || typeof file.arrayBuffer !== "function") {
-          return json({ error: "Please select a video." }, 400);
-        }
-        if (!["Movies", "Cartoons"].includes(category)) {
-          return json({ error: "Invalid category." }, 400);
-        }
-        if (!file.type.startsWith("video/")) {
-          return json({ error: "Only video files are allowed." }, 400);
-        }
-        if (file.size > 500 * 1024 * 1024) {
-          return json({ error: "Video is too large. Maximum size is 500 MB." }, 413);
-        }
-
-        const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-        const key = `${category}/${Date.now()}-${safeName}`;
-        const bytes = new Uint8Array(await file.arrayBuffer());
-        const result = await s3Request(env, "PUT", key, bytes, file.type || "video/mp4");
-
-        if (!result.ok) {
-          const detail = await result.text();
-          return json({ error: "Backblaze upload failed: " + result.status + " " + detail.slice(0, 300) }, 502);
-        }
-        return json({ success: true, key });
-      }
-
-      if (path === "/api/videos" && request.method === "DELETE") {
-        if (!(await isAdmin(request, env))) return json({ error: "Admin login required." }, 401);
-
-        const key = url.searchParams.get("key");
-        if (!key || !/^(Movies|Cartoons)\//.test(key)) {
-          return json({ error: "Invalid video key." }, 400);
-        }
-        const result = await s3Request(env, "DELETE", key);
-        if (!result.ok) {
-          return json({ error: "Backblaze delete failed: " + result.status }, 502);
-        }
-        return json({ success: true });
-      }
-
-      if (path.startsWith("/media/") && request.method === "GET") {
-        const key = path.slice("/media/".length).split("/").map(decodeURIComponent).join("/");
-        if (!/^(Movies|Cartoons)\//.test(key)) {
-          return new Response("Not found", { status: 404 });
-        }
-        const result = await s3Request(env, "GET", key);
-        if (!result.ok) return new Response("Video not found", { status: result.status });
-        return new Response(result.body, {
-          headers: {
-            "Content-Type": result.headers.get("Content-Type") || "video/mp4",
-            "Cache-Control": "public, max-age=3600",
-            "Accept-Ranges": "bytes"
-          }
-        });
-      }
-
-      return new Response("Not found", { status: 404 });
-    } catch (err) {
-      return json({ error: err.message || "Server error." }, 500);
+    }catch(error){
+      return json({error:error?.message||"Server error."},500);
     }
   }
 };
